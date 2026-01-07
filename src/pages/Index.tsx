@@ -1,6 +1,5 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { motion } from 'framer-motion';
-import Webcam from 'react-webcam';
 import DrawingCanvas from '@/components/DrawingCanvas';
 import StatusPanel from '@/components/StatusPanel';
 import Instructions from '@/components/Instructions';
@@ -17,9 +16,13 @@ const EMOTION_COLORS: Record<Emotion, string> = {
 };
 
 const Index: React.FC = () => {
-  const webcamRef = useRef<Webcam>(null);
-  const [isReady, setIsReady] = useState(false);
-  const [modelsLoaded, setModelsLoaded] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasOverlayRef = useRef<HTMLCanvasElement>(null);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [faceModelReady, setFaceModelReady] = useState(false);
+  const [handModelReady, setHandModelReady] = useState(false);
+  
   const [currentEmotion, setCurrentEmotion] = useState<{ emotion: Emotion; confidence: number }>({
     emotion: 'neutral',
     confidence: 0,
@@ -33,13 +36,54 @@ const Index: React.FC = () => {
   const emotionColor = EMOTION_COLORS[currentEmotion.emotion];
   const brushSize = Math.max(4, 40 * (1 - handData.depth));
 
-  // Load face-api models lazily
+  // Initialize camera
   useEffect(() => {
-    let mounted = true;
+    let stream: MediaStream | null = null;
     
-    const loadFaceModels = async () => {
+    const initCamera = async () => {
       try {
-        const faceapi = await import('face-api.js');
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { 
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            facingMode: 'user'
+          },
+          audio: false,
+        });
+        
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          await videoRef.current.play();
+          setCameraReady(true);
+          setCameraError(null);
+          console.log('Camera initialized successfully');
+        }
+      } catch (error) {
+        console.error('Camera error:', error);
+        setCameraError('Camera access denied or unavailable. Please allow camera access.');
+      }
+    };
+
+    initCamera();
+
+    return () => {
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, []);
+
+  // Face detection and emotion recognition
+  useEffect(() => {
+    if (!cameraReady || !videoRef.current) return;
+    
+    let animationId: number;
+    let faceApiLoaded = false;
+    let faceapi: typeof import('face-api.js');
+
+    const loadFaceApi = async () => {
+      try {
+        faceapi = await import('face-api.js');
         const MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
         
         await Promise.all([
@@ -47,33 +91,27 @@ const Index: React.FC = () => {
           faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL),
         ]);
         
-        if (mounted) {
-          setModelsLoaded(true);
-          console.log('Face models loaded');
-        }
+        faceApiLoaded = true;
+        setFaceModelReady(true);
+        console.log('Face-api models loaded');
+        detectFaces();
       } catch (error) {
-        console.error('Error loading face-api models:', error);
+        console.error('Face-api loading error:', error);
       }
     };
 
-    loadFaceModels();
-    return () => { mounted = false; };
-  }, []);
-
-  // Emotion detection interval
-  useEffect(() => {
-    if (!modelsLoaded) return;
-    
-    let interval: number;
-    
-    const detectEmotion = async () => {
-      const video = webcamRef.current?.video;
-      if (!video || video.readyState !== 4) return;
+    const detectFaces = async () => {
+      if (!faceApiLoaded || !videoRef.current || videoRef.current.paused) {
+        animationId = requestAnimationFrame(detectFaces);
+        return;
+      }
 
       try {
-        const faceapi = await import('face-api.js');
         const detection = await faceapi
-          .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
+          .detectSingleFace(videoRef.current, new faceapi.TinyFaceDetectorOptions({
+            inputSize: 224,
+            scoreThreshold: 0.5,
+          }))
           .withFaceExpressions();
 
         if (detection?.expressions) {
@@ -87,98 +125,182 @@ const Index: React.FC = () => {
           });
         }
       } catch (error) {
-        console.error('Emotion detection error:', error);
+        // Silently handle detection errors
       }
+
+      animationId = requestAnimationFrame(detectFaces);
     };
 
-    interval = window.setInterval(detectEmotion, 300);
-    return () => clearInterval(interval);
-  }, [modelsLoaded]);
+    loadFaceApi();
 
-  // Hand tracking with MediaPipe
+    return () => {
+      if (animationId) cancelAnimationFrame(animationId);
+    };
+  }, [cameraReady]);
+
+  // Hand tracking using MediaPipe Tasks Vision
   useEffect(() => {
-    let hands: any = null;
-    let camera: any = null;
-    let mounted = true;
+    if (!cameraReady || !videoRef.current) return;
+
+    let handLandmarker: any = null;
+    let animationId: number;
+    let lastVideoTime = -1;
 
     const initHandTracking = async () => {
-      const video = webcamRef.current?.video;
-      if (!video) return;
-
       try {
-        const { Hands } = await import('@mediapipe/hands');
-        const { Camera } = await import('@mediapipe/camera_utils');
+        const vision = await import('@mediapipe/tasks-vision');
+        const { HandLandmarker, FilesetResolver } = vision;
 
-        hands = new Hands({
-          locateFile: (file: string) => 
-            `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
-        });
+        const wasmFileset = await FilesetResolver.forVisionTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
+        );
 
-        hands.setOptions({
-          maxNumHands: 1,
-          modelComplexity: 0, // Use fastest model
-          minDetectionConfidence: 0.5,
+        handLandmarker = await HandLandmarker.createFromOptions(wasmFileset, {
+          baseOptions: {
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+          numHands: 1,
+          minHandDetectionConfidence: 0.5,
+          minHandPresenceConfidence: 0.5,
           minTrackingConfidence: 0.5,
         });
 
-        hands.onResults((results: any) => {
-          if (!mounted) return;
+        setHandModelReady(true);
+        console.log('Hand landmarker ready');
+        detectHands();
+      } catch (error) {
+        console.error('Hand tracking init error:', error);
+      }
+    };
+
+    const detectHands = () => {
+      if (!handLandmarker || !videoRef.current) {
+        animationId = requestAnimationFrame(detectHands);
+        return;
+      }
+
+      const video = videoRef.current;
+      
+      if (video.currentTime !== lastVideoTime && video.readyState >= 2) {
+        lastVideoTime = video.currentTime;
+        
+        try {
+          const results = handLandmarker.detectForVideo(video, performance.now());
           
-          if (results.multiHandLandmarks?.[0]) {
-            const landmarks = results.multiHandLandmarks[0];
+          if (results.landmarks && results.landmarks.length > 0) {
+            const landmarks = results.landmarks[0];
+            
+            // Index finger tip is landmark 8, thumb tip is landmark 4
             const indexTip = landmarks[8];
             const thumbTip = landmarks[4];
+            const indexMcp = landmarks[5]; // For depth reference
             
+            // Calculate pinch distance
             const pinchDistance = Math.sqrt(
               Math.pow(indexTip.x - thumbTip.x, 2) +
               Math.pow(indexTip.y - thumbTip.y, 2)
             );
             
+            // Calculate depth based on hand size (distance between landmarks)
+            const handSize = Math.sqrt(
+              Math.pow(indexTip.x - indexMcp.x, 2) +
+              Math.pow(indexTip.y - indexMcp.y, 2)
+            );
+            
+            // Normalize depth - larger hand = closer = smaller depth value
+            const depth = Math.max(0, Math.min(1, 1 - (handSize * 3)));
+            
             setHandData({
-              indexFinger: { x: indexTip.x, y: indexTip.y, z: indexTip.z },
-              isDrawing: pinchDistance < 0.06,
-              depth: Math.max(0, Math.min(1, (indexTip.z + 0.1) * 5)),
+              indexFinger: { 
+                x: indexTip.x, 
+                y: indexTip.y, 
+                z: indexTip.z || 0 
+              },
+              isDrawing: pinchDistance < 0.07,
+              depth,
             });
+
+            // Draw hand landmarks overlay
+            drawHandOverlay(landmarks);
           } else {
             setHandData(prev => ({ ...prev, indexFinger: null, isDrawing: false }));
+            clearOverlay();
           }
-        });
-
-        camera = new Camera(video, {
-          onFrame: async () => {
-            if (hands && video.readyState === 4) {
-              await hands.send({ image: video });
-            }
-          },
-          width: 640,
-          height: 480,
-        });
-
-        await camera.start();
-        if (mounted) {
-          setIsReady(true);
-          console.log('Hand tracking started');
+        } catch (error) {
+          // Silently handle detection errors
         }
-      } catch (error) {
-        console.error('Hand tracking error:', error);
       }
+
+      animationId = requestAnimationFrame(detectHands);
     };
 
-    // Wait for video to be ready
-    const checkVideo = setInterval(() => {
-      if (webcamRef.current?.video?.readyState === 4) {
-        clearInterval(checkVideo);
-        initHandTracking();
-      }
-    }, 100);
+    const drawHandOverlay = (landmarks: any[]) => {
+      const canvas = canvasOverlayRef.current;
+      const video = videoRef.current;
+      if (!canvas || !video) return;
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Draw landmarks
+      landmarks.forEach((point, index) => {
+        const x = point.x * canvas.width;
+        const y = point.y * canvas.height;
+        
+        ctx.beginPath();
+        ctx.arc(x, y, index === 8 ? 8 : 4, 0, 2 * Math.PI);
+        ctx.fillStyle = index === 8 ? emotionColor : 'rgba(255,255,255,0.7)';
+        ctx.fill();
+        
+        if (index === 8) {
+          ctx.strokeStyle = emotionColor;
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+      });
+
+      // Draw connections
+      const connections = [
+        [0, 1], [1, 2], [2, 3], [3, 4], // Thumb
+        [0, 5], [5, 6], [6, 7], [7, 8], // Index
+        [0, 9], [9, 10], [10, 11], [11, 12], // Middle
+        [0, 13], [13, 14], [14, 15], [15, 16], // Ring
+        [0, 17], [17, 18], [18, 19], [19, 20], // Pinky
+        [5, 9], [9, 13], [13, 17], // Palm
+      ];
+
+      ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+      ctx.lineWidth = 1;
+      
+      connections.forEach(([i, j]) => {
+        ctx.beginPath();
+        ctx.moveTo(landmarks[i].x * canvas.width, landmarks[i].y * canvas.height);
+        ctx.lineTo(landmarks[j].x * canvas.width, landmarks[j].y * canvas.height);
+        ctx.stroke();
+      });
+    };
+
+    const clearOverlay = () => {
+      const canvas = canvasOverlayRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    };
+
+    initHandTracking();
 
     return () => {
-      mounted = false;
-      clearInterval(checkVideo);
-      camera?.stop();
-      hands?.close();
+      if (animationId) cancelAnimationFrame(animationId);
+      if (handLandmarker) handLandmarker.close();
     };
-  }, []);
+  }, [cameraReady, emotionColor]);
 
   return (
     <div className="min-h-screen bg-background overflow-hidden">
@@ -219,18 +341,9 @@ const Index: React.FC = () => {
           </div>
           
           <div className="flex items-center gap-4 text-xs">
-            <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full ${modelsLoaded ? 'bg-green-500' : 'bg-yellow-500 animate-pulse'}`} />
-              <span className="text-muted-foreground">
-                {modelsLoaded ? 'Face AI Ready' : 'Loading Face AI...'}
-              </span>
-            </div>
-            <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full ${isReady ? 'bg-green-500' : 'bg-yellow-500 animate-pulse'}`} />
-              <span className="text-muted-foreground">
-                {isReady ? 'Hands Ready' : 'Loading Hands...'}
-              </span>
-            </div>
+            <StatusIndicator ready={cameraReady} label="Camera" />
+            <StatusIndicator ready={faceModelReady} label="Face AI" />
+            <StatusIndicator ready={handModelReady} label="Hands" />
           </div>
         </motion.div>
       </header>
@@ -243,24 +356,33 @@ const Index: React.FC = () => {
             <motion.div
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
-              className="relative overflow-hidden rounded-2xl"
+              className="relative overflow-hidden rounded-2xl aspect-video"
               style={{ boxShadow: `0 0 30px ${emotionColor}40` }}
             >
               <div
-                className="absolute inset-0 rounded-2xl pointer-events-none z-10"
+                className="absolute inset-0 rounded-2xl pointer-events-none z-20"
                 style={{ border: `2px solid ${emotionColor}` }}
               />
-              <Webcam
-                ref={webcamRef}
-                audio={false}
-                mirrored
-                className="w-full aspect-video object-cover rounded-2xl"
-                videoConstraints={{
-                  width: 640,
-                  height: 480,
-                  facingMode: 'user',
-                }}
-              />
+              
+              {cameraError ? (
+                <div className="absolute inset-0 flex items-center justify-center bg-card p-4">
+                  <p className="text-sm text-destructive text-center">{cameraError}</p>
+                </div>
+              ) : (
+                <>
+                  <video
+                    ref={videoRef}
+                    autoPlay
+                    playsInline
+                    muted
+                    className="w-full h-full object-cover rounded-2xl scale-x-[-1]"
+                  />
+                  <canvas
+                    ref={canvasOverlayRef}
+                    className="absolute inset-0 w-full h-full rounded-2xl scale-x-[-1] pointer-events-none z-10"
+                  />
+                </>
+              )}
             </motion.div>
             <Instructions />
           </div>
@@ -297,5 +419,20 @@ const Index: React.FC = () => {
     </div>
   );
 };
+
+// Status indicator component
+const StatusIndicator: React.FC<{ ready: boolean; label: string }> = ({ ready, label }) => (
+  <div className="flex items-center gap-2">
+    <div 
+      className={`w-2 h-2 rounded-full transition-all ${
+        ready ? 'bg-green-500' : 'bg-yellow-500 animate-pulse'
+      }`}
+      style={{
+        boxShadow: ready ? '0 0 8px hsl(120, 60%, 50%)' : undefined,
+      }}
+    />
+    <span className="text-muted-foreground">{label}</span>
+  </div>
+);
 
 export default Index;
